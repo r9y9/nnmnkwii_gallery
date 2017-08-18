@@ -4,9 +4,11 @@ usage:
     prepare_features.py [options] <DATA_ROOT>
 
 options:
-    --overwrite          Overwrite files
-    --max_num_files=<N>  Max num files to be collected. [default: -1]
-    -h, --help           show this help message and exit
+    --overwrite              Overwrite files
+    --max_num_files=<N>      Max num files to be collected. [default: -1]
+    --use_phone_alignment    Use phone-level alignment
+    --question_path=<path>   Question file path.
+    -h, --help               show this help message and exit
 """
 from __future__ import division, print_function, absolute_import
 
@@ -32,31 +34,34 @@ import sys
 
 global DATA_ROOT
 
-fs = 16000
+max_num_files = None
 order = 59
 frame_period = 5
-fftlen = pyworld.get_cheaptrick_fft_size(fs)
-alpha = pysptk.util.mcepalpha(fs)
 windows = [
     (0, 0, np.array([1.0])),
     (1, 1, np.array([-0.5, 0.0, 0.5])),
     (1, 1, np.array([1.0, -2.0, 1.0])),
 ]
 
-global max_num_files
-max_num_files = -1
-
-
 class LinguisticSource(FileDataSource):
-    def __init__(self, add_frame_features=False, subphone_features=None):
+    def __init__(self, add_frame_features=False, subphone_features=None,
+                 use_phone_alignment=False, question_path=None):
         self.add_frame_features = add_frame_features
         self.subphone_features = subphone_features
         self.test_paths = None
-        self.binary_dict, self.continuous_dict = hts.load_question_set(
-            join(DATA_ROOT, "questions-radio_dnn_416.hed"))
+        self.use_phone_alignment = use_phone_alignment
+        if question_path is None:
+            self.binary_dict, self.continuous_dict = hts.load_question_set(
+                join(DATA_ROOT, "questions-radio_dnn_416.hed"))
+        else:
+            self.binary_dict, self.continuous_dict = hts.load_question_set(
+                question_path)
 
     def collect_files(self):
-        files = sorted(glob(join(DATA_ROOT, "label_state_align", "*.lab")))
+        if self.use_phone_alignment:
+            files = sorted(glob(join(DATA_ROOT, "label_phone_align", "*.lab")))
+        else:
+            files = sorted(glob(join(DATA_ROOT, "label_state_align", "*.lab")))
         if max_num_files is not None and max_num_files > 0:
             return files[:max_num_files]
         else:
@@ -78,8 +83,14 @@ class LinguisticSource(FileDataSource):
 
 
 class DurationFeatureSource(FileDataSource):
+    def __init__(self, use_phone_alignment=False):
+        self.use_phone_alignment = use_phone_alignment
+
     def collect_files(self):
-        files = sorted(glob(join(DATA_ROOT, "label_state_align", "*.lab")))
+        if self.use_phone_alignment:
+            files = sorted(glob(join(DATA_ROOT, "label_phone_align", "*.lab")))
+        else:
+            files = sorted(glob(join(DATA_ROOT, "label_state_align", "*.lab")))
         if max_num_files is not None and max_num_files > 0:
             return files[:max_num_files]
         else:
@@ -94,10 +105,17 @@ class DurationFeatureSource(FileDataSource):
 
 
 class AcousticSource(FileDataSource):
+    def __init__(self, use_phone_alignment=False):
+        self.use_phone_alignment = use_phone_alignment
+
     def collect_files(self):
         wav_paths = sorted(glob(join(DATA_ROOT, "wav", "*.wav")))
-        label_paths = sorted(
-            glob(join(DATA_ROOT, "label_state_align", "*.lab")))
+        if self.use_phone_alignment:
+            label_paths = sorted(
+                glob(join(DATA_ROOT, "label_phone_align", "*.lab")))
+        else:
+            label_paths = sorted(
+                glob(join(DATA_ROOT, "label_state_align", "*.lab")))
         if max_num_files is not None and max_num_files > 0:
             return wav_paths[:max_num_files], label_paths[:max_num_files]
         else:
@@ -112,7 +130,8 @@ class AcousticSource(FileDataSource):
         aperiodicity = pyworld.d4c(x, f0, timeaxis, fs)
 
         bap = pyworld.code_aperiodicity(aperiodicity, fs)
-        mgc = pysptk.sp2mc(spectrogram, order=order, alpha=alpha)
+        mgc = pysptk.sp2mc(spectrogram, order=order,
+                           alpha=pysptk.util.mcepalpha(fs))
         f0 = f0[:, None]
         lf0 = f0.copy()
         nonzero_indices = np.nonzero(f0)
@@ -141,14 +160,18 @@ if __name__ == "__main__":
     DST_ROOT = DATA_ROOT
     max_num_files = int(args["--max_num_files"])
     overwrite = args["--overwrite"]
+    use_phone_alignment = args["--use_phone_alignment"]
+    question_path = args["--question_path"]
 
     # Features required to train duration model
     # X -> Y
     # X: linguistic
     # Y: duration
     X_duration_source = LinguisticSource(
-        add_frame_features=False, subphone_features=None)
-    Y_duration_source = DurationFeatureSource()
+        add_frame_features=False, subphone_features=None,
+        use_phone_alignment=use_phone_alignment, question_path=question_path)
+    Y_duration_source = DurationFeatureSource(
+        use_phone_alignment=use_phone_alignment)
 
     X_duration = FileSourceDataset(X_duration_source)
     Y_duration = FileSourceDataset(Y_duration_source)
@@ -157,9 +180,11 @@ if __name__ == "__main__":
     # X -> Y
     # X: linguistic
     # Y: acoustic
+    subphone_features = "full" if not use_phone_alignment else "coarse_coding"
     X_acoustic_source = LinguisticSource(
-        add_frame_features=True, subphone_features="full")
-    Y_acoustic_source = AcousticSource()
+        add_frame_features=True, subphone_features=subphone_features,
+        use_phone_alignment=use_phone_alignment, question_path=question_path)
+    Y_acoustic_source = AcousticSource(use_phone_alignment=use_phone_alignment)
     X_acoustic = FileSourceDataset(X_acoustic_source)
     Y_acoustic = FileSourceDataset(Y_acoustic_source)
 
@@ -185,6 +210,8 @@ if __name__ == "__main__":
 
     # Save features for duration model
     if not skip_duration_feature_extraction:
+        print("Duration linguistic feature dim", X_duration[0].shape)
+        print("Duration feature dim", Y_duration[0].shape)
         for idx, (x, y) in tqdm(enumerate(zip(X_duration, Y_duration))):
             name = splitext(basename(X_duration.collected_files[idx][0]))[0]
             xpath = join(X_duration_root, name + ".bin")
@@ -196,6 +223,8 @@ if __name__ == "__main__":
 
     # Save features for acoustic model
     if not skip_acoustic_feature_extraction:
+        print("Acoustic linguistic feature dim", X_acoustic[0].shape)
+        print("Acoustic feature dim", Y_acoustic[0].shape)
         for idx, (x, y) in tqdm(enumerate(zip(X_acoustic, Y_acoustic))):
             name = splitext(basename(X_acoustic.collected_files[idx][0]))[0]
             xpath = join(X_acoustic_root, name + ".bin")
